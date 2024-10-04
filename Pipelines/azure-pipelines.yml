@@ -81,7 +81,7 @@ stages:
                     ConnectionType: 'AzureRM'
                     azureSubscription: '$(azureSubscription)'
                     WebAppName: 'app-$(applicationName)-$(environment)'
-                    ResourceGroupName: 'rg-$(applicationName)NexLabChaosStudio-Lab'
+                    ResourceGroupName: 'rg-$(applicationName)-$(environment)'
                     package: $(Pipeline.Workspace)/NexLabAzureChaosTesting/NexLabAzureChaosTesting.zip
   - stage: EnvironmentTests
     displayName: 'Environment tests'
