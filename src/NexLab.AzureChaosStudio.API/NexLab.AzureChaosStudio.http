@@ -1,0 +1,6 @@
+@NexLab.AzureChaosStudio_HostAddress = http://localhost:5133
+
+GET {{NexLab.AzureChaosStudio_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

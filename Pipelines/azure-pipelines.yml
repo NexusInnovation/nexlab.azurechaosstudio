@@ -1,0 +1,201 @@
+stages:
+  - stage: Build
+    jobs:
+      - job: Build
+        pool:
+          vmImage: windows-latest
+        displayName: 'Build'
+        condition: not(canceled())
+
+        steps:
+          - task: UseDotNet@2
+            displayName: 'Use .NET Core sdk 8.0.x'
+            inputs:
+              packageType: 'sdk'
+              version: '8.0.x'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Restore solution'
+            inputs:
+              command: 'restore'
+              projects: '$(Build.SourcesDirectory)/src/*.sln'
+              feedsToUse: 'select'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Build solution'
+            inputs:
+              command: 'build'
+              projects: '$(Build.SourcesDirectory)/src/NexLab.AzureChaosStudio.API/NexLab.AzureChaosStudio.API.csproj'
+              arguments: '--property:OutputPath=$(System.DefaultWorkingDirectory)/publish_output --configuration Release /nr:false'
+
+          - task: CopyFiles@2
+            displayName: 'Copy Build Output'
+            inputs:
+              contents: '_buildOutput/**'
+              targetFolder: $(Build.ArtifactStagingDirectory)
+
+          - task: ArchiveFiles@2
+            displayName: 'Archive solution'
+            inputs:
+              rootFolderOrFile: '$(System.DefaultWorkingDirectory)/publish_output'
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/NexLabAzureChaosTesting.zip
+              replaceExistingArchive: true
+
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: 'NexLabAzureChaosTesting'
+            displayName: 'Publish Artifacts'
+  - stage: Deploy
+    jobs:
+      - job: Deploy_Infra
+        pool:
+          vmImage: windows-latest
+        displayName: 'Deploy'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Create or Update Azure Infrastructure'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: pscore
+              scriptLocation: inlineScript
+              useGlobalConfig: true
+              inlineScript: |
+                az --version
+                az deployment sub create --name 'NexLabAzureChaosTesting' --location 'canadacentral' --template-file 'Infra-as-code/main.bicep'
+
+      - deployment: 'Deploy_Backend'
+        condition: and(not(canceled()), not(failed()))
+        displayName: 'Deploy Backend'
+        environment: 'Lab'
+        dependsOn: 'Deploy_Infra'
+        pool:
+          vmImage: windows-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureRmWebAppDeployment@4
+                  displayName: 'Deploy Backend'
+                  inputs:
+                    ConnectionType: 'AzureRM'
+                    azureSubscription: '$(azureSubscription)'
+                    WebAppName: 'app-$(applicationName)-$(environment)'
+                    ResourceGroupName: 'rg-$(applicationName)NexLabChaosStudio-Lab'
+                    package: $(Pipeline.Workspace)/NexLabAzureChaosTesting/NexLabAzureChaosTesting.zip
+  - stage: EnvironmentTests
+    displayName: 'Environment tests'
+    jobs:
+      - job: EnvironmentTests
+        displayName: 'Environment tests'
+        steps:
+          - script: |
+              echo "Waiting for the App Service to be ready..."
+              appUrl="https://app-$(applicationName)-$(environment).azurewebsites.net/health"
+              maxRetries=30
+              retryInterval=30
+
+              for ((i=1; i<=$maxRetries; i++)); do
+                httpStatus=$(curl -o /dev/null -s -w "%{http_code}" $appUrl)
+                
+                if [ "$httpStatus" -eq 200 ]; then
+                  echo "App Service is ready."
+                  exit 0
+                fi
+                
+                echo "Retry $i/$maxRetries: App Service not ready yet. HTTP Status: $httpStatus"
+                sleep $retryInterval
+              done
+
+              echo "App Service did not become ready in time."
+              exit 1
+            displayName: 'Check App Service is ready before running tests'
+          - task: PowerShell@2
+            displayName: 'Test getting an available secret'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $response = Invoke-WebRequest -Uri app-$(applicationName)-$(environment).azurewebsites.net/Secret -Method Get
+                Write-Host $response
+          - task: AzureCLI@2
+            displayName: 'Running Azure Chaos Studio Tests'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: pscore
+              scriptLocation: inlineScript
+              useGlobalConfig: true
+              inlineScript: |
+                az --version
+                az rest --method post --uri https://management.azure.com/subscriptions/$(subscriptionId)/resourceGroups/rg-$(applicationName)-$(environment)/providers/Microsoft.Chaos/experiments/chexp-$(applicationName)-$(environment)/start?api-version=2024-03-22-preview
+          - task: AzureCLI@2
+            displayName: 'Give the Chaos Experiment some time to launch'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: pscore
+              scriptLocation: inlineScript
+              useGlobalConfig: true
+              inlineScript: |
+                az --version
+                Start-Sleep -Seconds 60
+          - task: PowerShell@2
+            displayName: 'Send fail requests'
+            inputs:
+              targetType: 'inline'
+              script: |
+                for ($i=1; $i -le 10; $i++){
+                  try {
+                    Invoke-WebRequest -Uri app-$(applicationName)-$(environment).azurewebsites.net/WeatherForecast -Method Get -SkipHttpErrorCheck
+                    Start-Sleep -Seconds 5
+                  } 
+                  catch [System.Net.WebException] {
+                    exit 0
+                  }
+                }
+          - script: |
+              echo "Waiting for the App Service to be ready..."
+              appUrl="https://app-$(applicationName)-$(environment).azurewebsites.net/health"
+              maxRetries=30
+              retryInterval=30
+
+              for ((i=1; i<=$maxRetries; i++)); do
+                httpStatus=$(curl -o /dev/null -s -w "%{http_code}" $appUrl)
+                
+                if [ "$httpStatus" -eq 200 ]; then
+                  echo "App Service is ready."
+                  exit 0
+                fi
+                
+                echo "Retry $i/$maxRetries: App Service not ready yet. HTTP Status: $httpStatus"
+                sleep $retryInterval
+              done
+
+              echo "App Service did not become ready in time."
+              exit 1
+            displayName: 'Wait for App Service to be healthy again'
+          - task: PowerShell@2
+            displayName: 'Try to access Secret again'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $response = Invoke-WebRequest -Uri app-$(applicationName)-$(environment).azurewebsites.net/Secret -Method Get -SkipHttpErrorCheck
+                Write-Host $response
+                if($response.StatusCode -ne 502){
+                  Write-Host 'Unexpected response'
+                  exit 1
+                }
+          - task: AzureCLI@2
+            displayName: 'Check if Alert was fired'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: pscore
+              scriptLocation: inlineScript
+              useGlobalConfig: true
+              inlineScript: |
+                az --version
+                for ($i=1; $i -le 10; $i++){
+                  $response = az rest --method GET --headers "Content-Type=application/json" --uri "https://management.azure.com/subscriptions/$(subscriptionId)/providers/Microsoft.AlertsManagement/alerts?api-version=2019-05-05-preview" --url-parameters targetResource="/subscriptions/$(subscriptionId)/resourcegroups/rg-$(applicationName)-$(environment)/providers/microsoft.web/sites/app-$(applicationName)-$(environment)" timeRange=1h monitorCondition=Fired | ConvertFrom-Json
+                  if ($response.Count -eq 0) {
+                    Write-Host "No alert received. Failing task"
+                    exit 1
+                  }                  
+                }
